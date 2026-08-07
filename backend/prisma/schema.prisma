@@ -1,0 +1,119 @@
+// L'Oréal Claims Intelligence Engine — Prisma schema
+// Models the full business flow:
+//   Business team -> Claim (PROPOSED)
+//   Claim Manager -> filters for applicability/feasibility (UNDER_REVIEW -> APPROVED_FOR_TESTING/REJECTED)
+//   Scientist -> submits product Formulation
+//   Evaluator -> submits Evidence (clinical study results)
+//   System (LLM) -> produces an Assessment of whether the Evidence justifies the Claim
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // swap to "sqlite" for local-only demo runs
+  url      = env("DATABASE_URL")
+}
+
+enum ClaimStatus {
+  PROPOSED // created by Business team
+  UNDER_REVIEW // Claim Manager evaluating applicability/feasibility
+  APPROVED_FOR_TESTING // Claim Manager approved -> Scientist can formulate
+  REJECTED // Claim Manager rejected, flow ends
+  FORMULATED // Scientist has submitted a Formulation
+  EVIDENCE_SUBMITTED // Evaluator has submitted a clinical study
+  ASSESSED // LLM has produced at least one Assessment
+}
+
+enum AssessmentStatus {
+  COMPLETED
+  FAILED // LLM call errored or returned unparsable output; kept for audit/observability
+}
+
+model Product {
+  id        String   @id @default(cuid())
+  name      String
+  brand     String?
+  createdAt DateTime @default(now())
+  claims    Claim[]
+}
+
+model Claim {
+  id         String      @id @default(cuid())
+  productId  String
+  product    Product     @relation(fields: [productId], references: [id])
+  text       String // e.g. "Reduces wrinkles by 20% in 4 weeks"
+  category   String? // e.g. "anti-aging", "hydration", "SPF"
+  status     ClaimStatus @default(PROPOSED)
+  proposedBy String // Business team user id/email
+  reviewedBy String? // Claim Manager user id/email
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  formulation Formulation?
+  evidence    Evidence[]
+  assessments Assessment[]
+
+  @@index([status])
+}
+
+model Formulation {
+  id          String   @id @default(cuid())
+  claimId     String   @unique
+  claim       Claim    @relation(fields: [claimId], references: [id])
+  description String
+  ingredients Json // structured INCI list / concentrations
+  testMethod  String? // formulation test protocol used by the Scientist
+  submittedBy String // Scientist user id/email
+  createdAt   DateTime @default(now())
+}
+
+model Evidence {
+  id             String   @id @default(cuid())
+  claimId        String
+  claim          Claim    @relation(fields: [claimId], references: [id])
+  studyTitle     String
+  methodology    String // e.g. "Double-blind, placebo-controlled, n=45, 4 weeks"
+  sampleSize     Int?
+  durationWeeks  Int?
+  resultsSummary String   @db.Text // the free-text clinical study result the Evaluator submits
+  attachmentUrl  String? // link to full PDF report in blob storage
+  submittedBy    String // Evaluator user id/email
+  createdAt      DateTime @default(now())
+
+  assessments Assessment[]
+
+  @@index([claimId])
+}
+
+/// One LLM-generated verdict on whether a piece of Evidence justifies a Claim.
+/// claimId/evidenceId are optional (nullable) so the same endpoint also supports
+/// ad-hoc "paste text and evaluate" usage during early triage/demo, without a full
+/// Claim/Evidence record having been created yet. Text is snapshotted so an
+/// Assessment always reflects exactly what was evaluated, even if the source
+/// Claim/Evidence is edited later — required for audit/compliance defensibility.
+model Assessment {
+  id         String    @id @default(cuid())
+  claimId    String?
+  claim      Claim?    @relation(fields: [claimId], references: [id])
+  evidenceId String?
+  evidence   Evidence? @relation(fields: [evidenceId], references: [id])
+
+  claimTextSnapshot    String @db.Text
+  evidenceTextSnapshot String @db.Text
+
+  justified       Boolean
+  confidenceScore Float // 0.0 - 1.0
+  reasoning       String @db.Text
+
+  modelUsed     String // e.g. "gpt-4o-mini"
+  promptVersion String @default("v1") // increment when the system prompt changes, for auditability
+  rawResponse   Json? // full raw LLM response, kept for debugging/audit
+
+  status AssessmentStatus @default(COMPLETED)
+
+  createdAt DateTime @default(now())
+
+  @@index([claimId])
+  @@index([createdAt])
+}
